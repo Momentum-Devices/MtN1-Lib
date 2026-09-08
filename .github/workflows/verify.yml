@@ -5,19 +5,29 @@ on:
     branches: [ main ]
     paths:
       - 'src/**'
-      - '.github/workflows/verify.yml'
+      - 'examples/**'
+      - 'library.properties'
   pull_request:
     branches: [ main ]
     paths:
       - 'src/**'
-      - '.github/workflows/verify.yml'
+      - 'examples/**'
+      - 'library.properties'
+  workflow_dispatch:
 
 jobs:
   compile:
     runs-on: ubuntu-latest
 
+    env:
+      ESP32_URL: https://espressif.github.io/arduino-esp32/package_esp32_index.json
+      FQBN: esp32:esp32:esp32s3
+      LIB_NAME: Carbonara_DRV8874
+      # Set this to your main public header in src/, e.g. MtN1.h
+      LIB_HEADER: Carbonara_DRV8874.h
+
     steps:
-      - name: Checkout Code
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup Arduino CLI
@@ -26,47 +36,78 @@ jobs:
       - name: Configure Arduino CLI
         run: |
           arduino-cli config init --overwrite
+          arduino-cli config add board_manager.additional_urls "$ESP32_URL"
           arduino-cli config set library.enable_unsafe_install true
 
-      - name: Cache ESP32 Core and Tools
-        id: cache-esp32
+      - name: Cache Arduino data
         uses: actions/cache@v4
         with:
           path: |
-            ~/.arduino15/packages/esp32
-            ~/.arduino15/package_esp32_index.json
-          key: ${{ runner.os }}-esp32-core-v3.0.0
+            ~/.arduino15
+            ~/Arduino
+          key: ${{ runner.os }}-arduino-${{ env.FQBN }}-v1
+          restore-keys: |
+            ${{ runner.os }}-arduino-
 
-      - name: Install ESP32 Platform Core
-        if: steps.cache-esp32.outputs.cache-hit != 'true'
+      - name: Update indexes
         run: |
-          arduino-cli core update-index --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
-          arduino-cli core install esp32:esp32 --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
-
-      - name: Zip Release Folder
-        run: |
-          # Create a wrapper folder with the library name
-          mkdir -p MtN1-Lib
-          # Copy library files into the wrapper folder
-          cp -r src/ examples/ library.properties keywords.txt README.md MtN1-Lib/ 2>/dev/null || true
-          # Zip the wrapper folder
-          zip -r MtN1-Lib.zip MtN1-Lib/ -x "*.git*" "*.github*"
-          
-      - name: Install Project Dependencies
-        run: |
-
-          # Force CLI to update lib list
+          arduino-cli core update-index
           arduino-cli lib update-index
-          
-          # 1. Install standard public registry libraries
-          arduino-cli lib install "Alfredo-NoU3"
-          arduino-cli lib install "PestoLink-Receive"
-          arduino-cli lib install "Adafruit MCP23017 Arduino Library"
-          arduino-cli lib install "Adafruit PWM Servo Driver Library"
-          
-          arduino-cli lib install --zip-path ./MtN1-Lib.zip
 
-      - name: Verify and Compile Sketch
+      - name: Install ESP32 core
         run: |
-          # Crucial: Ensure your repository name matches the exact folder name containing your main .ino file
-          arduino-cli compile --fqbn esp32:esp32:esp32s3 examples/GPIO_Check/GPIO_Check.ino
+          arduino-cli core install esp32:esp32
+
+      - name: Build ZIP for local library install
+        run: |
+          set -euxo pipefail
+          mkdir -p "${LIB_NAME}"
+          cp -r src "${LIB_NAME}/"
+          [ -d examples ] && cp -r examples "${LIB_NAME}/" || true
+          [ -f library.properties ] && cp library.properties "${LIB_NAME}/" || true
+          [ -f keywords.txt ] && cp keywords.txt "${LIB_NAME}/" || true
+          [ -f README.md ] && cp README.md "${LIB_NAME}/" || true
+          zip -r "${LIB_NAME}.zip" "${LIB_NAME}"
+
+      - name: Install dependency libraries
+        run: |
+          set -euxo pipefail
+          arduino-cli lib install "Alfredo-NoU3"
+
+      - name: Install this library from ZIP
+        run: |
+          set -euxo pipefail
+          arduino-cli lib install --zip-path "./${LIB_NAME}.zip"
+
+      - name: Create blank verification sketch (auto header)
+        run: |
+          set -euxo pipefail
+          HEADER="$(find src -maxdepth 1 -type f -name '*.h' | head -n 1 | xargs -n1 basename)"
+          if [ -z "${HEADER:-}" ]; then
+            echo "No header found in src/"
+            exit 1
+          fi
+      
+          mkdir -p verify-sketch
+          cat > verify-sketch/verify-sketch.ino <<EOF
+          #include <${HEADER}>
+      
+          void setup() {}
+          void loop() {}
+          EOF
+      
+          echo "Using header: ${HEADER}"
+
+      - name: Compile blank verification sketch
+        run: |
+          arduino-cli compile --fqbn "$FQBN" verify-sketch/verify-sketch.ino
+
+      - name: (Optional) Compile example sketches too
+        run: |
+          set -euxo pipefail
+          if [ -d examples ]; then
+            find examples -name "*.ino" -print0 | while IFS= read -r -d '' sketch; do
+              echo "Compiling $sketch"
+              arduino-cli compile --fqbn "$FQBN" "$sketch"
+            done
+          fi
